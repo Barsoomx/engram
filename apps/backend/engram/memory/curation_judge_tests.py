@@ -262,53 +262,23 @@ def _two_entry_fixture() -> tuple[object, object, tuple[object, object], object]
 
 
 def _payload(
-    entry: object,
     *,
-    outcome: str = 'publish_new',
     relation: str = 'unrelated',
-    target: str | None = None,
-    candidate_refs: list[str] | None = None,
-    target_refs: list[str] | None = None,
-    comparisons: list[dict[str, object]] | None = None,
-    reason_code: str = 'distinct_claim',
     applicability: str = 'same',
-    temporal_order: str = 'not_applicable',
+    comparisons: list[dict[str, object]] | None = None,
     reason: str = 'distinct claim',
 ) -> dict[str, object]:
-    memory_version_id = str(entry.memory_version_id)
     return {
-        'schema_version': 1,
-        'outcome': outcome,
-        'relation': relation,
-        'target_memory_version_id': target,
-        'candidate_evidence_refs': (
-            candidate_refs if candidate_refs is not None else ['candidate-ref', 'candidate-ref-2']
-        ),
+        'schema_version': 2,
         'comparisons': comparisons
         if comparisons is not None
-        else [
-            {
-                'memory_version_id': memory_version_id,
-                'relation': relation,
-                'target_evidence_refs': target_refs if target_refs is not None else ['target-ref'],
-            },
-        ],
-        'applicability': applicability,
-        'temporal_order': temporal_order,
-        'reason_code': reason_code,
+        else [{'index': 1, 'relation': relation, 'applicability': applicability}],
         'reason': reason,
     }
 
 
 def _manifest_comparisons(entries: tuple[object, ...]) -> list[dict[str, object]]:
-    return [
-        {
-            'memory_version_id': str(entry.memory_version_id),
-            'relation': 'unrelated',
-            'target_evidence_refs': [f'target-ref-{index + 1}'],
-        }
-        for index, entry in enumerate(entries)
-    ]
+    return [{'index': index, 'relation': 'unrelated', 'applicability': 'same'} for index in range(1, len(entries) + 1)]
 
 
 def _semantic_snapshot(project_id: UUID) -> dict[str, tuple[object, ...]]:
@@ -365,29 +335,21 @@ def test_malformed_judge_output_has_no_default_semantic_outcome() -> None:
 
 
 @pytest.mark.django_db
-def test_judge_cannot_reference_memory_or_evidence_outside_manifest() -> None:
-    module, data, entry, candidate = _fixture()
-    foreign_target = str(uuid.uuid4())
-    foreign_payload = _payload(entry, target=foreign_target, relation='equivalent', outcome='merge_evidence')
+@pytest.mark.parametrize('index', [0, 2, -1])
+def test_judge_cannot_reference_a_comparison_outside_the_shortlist(index: int) -> None:
+    module, data, _entry, candidate = _fixture()
+    foreign_payload = _payload(comparisons=[{'index': index, 'relation': 'equivalent', 'applicability': 'same'}])
 
     with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
         module.parse_curation_judge_verdict(json.dumps(foreign_payload), data)
 
     assert getattr(error.value, 'code', None) == 'judge_invalid_output'
 
-    foreign_payload = _payload(entry, relation='equivalent', outcome='merge_evidence')
-    foreign_payload['comparisons'][0]['target_evidence_refs'] = ['not-in-manifest']
-    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
-        module.parse_curation_judge_verdict(json.dumps(foreign_payload), data)
-
-    assert getattr(error.value, 'code', None) == 'judge_reference_invalid'
-
 
 @pytest.mark.django_db
 def test_fallback_verdict_must_pass_the_same_strict_schema(monkeypatch: pytest.MonkeyPatch) -> None:
     module, data, entries, candidate = _two_entry_fixture()
     data = replace(data, candidate=replace(data.candidate, body='Use sk-abcdefghijklmnop in production'))
-    entry = entries[0]
     candidate.refresh_from_db()
     organization, project = candidate.organization, candidate.project
     session_team = candidate.team
@@ -395,7 +357,7 @@ def test_fallback_verdict_must_pass_the_same_strict_schema(monkeypatch: pytest.M
     primary.fallback_enabled = True
     primary.save(update_fields=['fallback_enabled'])
     create_curation_policy(organization, session_team, project, task_type='generation')
-    malformed_fallback = _payload(entry, comparisons=_manifest_comparisons(entries))
+    malformed_fallback = _payload(comparisons=_manifest_comparisons(entries))
     malformed_fallback['comparisons'][0]['nested'] = {'forbidden': True}
     calls: list[object] = []
 
@@ -419,25 +381,18 @@ def test_fallback_verdict_must_pass_the_same_strict_schema(monkeypatch: pytest.M
 
     assert getattr(error.value, 'code', None) == 'judge_invalid_output'
     assert len(calls) == 2
-    assert all(call.response_kind == 'curation_decision_v1' for call in calls)
+    assert all(call.response_kind == 'curation_decision_v2' for call in calls)
     prompt = json.loads(calls[0].prompt)
-    assert [item['memory_version_id'] for item in prompt['comparisons']] == [
-        str(entry.memory_version_id) for entry in entries
-    ]
+    assert [item['index'] for item in prompt['comparisons']] == list(range(1, len(entries) + 1))
     assert 'vector_distance' not in calls[0].prompt
     assert 'sk-' not in calls[0].prompt
 
 
 @pytest.mark.django_db
 def test_destructive_verdict_below_evidence_threshold_is_not_applied() -> None:
-    module, data, entry, candidate = _fixture(comparison_complete=False)
+    module, data, _entry, candidate = _fixture(comparison_complete=False)
     destructive = _payload(
-        entry,
-        outcome='supersede_memory',
         relation='candidate_supersedes',
-        target=str(entry.memory_version_id),
-        reason_code='ordered_replacement',
-        temporal_order='candidate_newer',
         reason='destructive outcome lacks complete comparison',
     )
 
@@ -457,13 +412,7 @@ def test_similarity_point_999_cannot_choose_destructive_outcome() -> None:
         evidence=replace(data.evidence, candidate=module.ClaimEvidence(tier='supported', refs=('candidate-ref',))),
     )
     destructive = _payload(
-        ranked_entry,
-        outcome='supersede_memory',
         relation='candidate_supersedes',
-        target=str(ranked_entry.memory_version_id),
-        candidate_refs=['candidate-ref'],
-        reason_code='ordered_replacement',
-        temporal_order='candidate_newer',
         reason='high similarity is retrieval evidence only',
     )
 
@@ -479,18 +428,8 @@ def test_conflict_tag_blocks_revise_and_supersede_targets() -> None:
     module, data, entry, candidate = _fixture()
     conflicted = replace(entry, has_open_conflict=True)
     data = replace(data, shortlist=replace(data.shortlist, entries=(conflicted,)))
-    for outcome, relation, reason_code in (
-        ('revise_memory', 'candidate_revises', 'same_subject_revision'),
-        ('supersede_memory', 'candidate_supersedes', 'ordered_replacement'),
-    ):
-        payload = _payload(
-            conflicted,
-            outcome=outcome,
-            relation=relation,
-            target=str(conflicted.memory_version_id),
-            reason_code=reason_code,
-            temporal_order='candidate_newer',
-        )
+    for relation in ('candidate_revises', 'candidate_supersedes'):
+        payload = _payload(relation=relation)
         with _unchanged(candidate.project_id):
             verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
         assert verdict.outcome == 'publish_new'
@@ -502,15 +441,7 @@ def test_conflict_tag_blocks_merge_evidence_target() -> None:
     module, data, entry, candidate = _fixture()
     conflicted = replace(entry, has_open_conflict=True)
     data = replace(data, shortlist=replace(data.shortlist, entries=(conflicted,)))
-    payload = _payload(
-        conflicted,
-        outcome='merge_evidence',
-        relation='equivalent',
-        target=str(conflicted.memory_version_id),
-        reason_code='equivalent_claim',
-        applicability='same',
-        temporal_order='not_applicable',
-    )
+    payload = _payload(relation='equivalent')
 
     with _unchanged(candidate.project_id):
         verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
@@ -519,24 +450,8 @@ def test_conflict_tag_blocks_merge_evidence_target() -> None:
     assert verdict.target_memory_version_id is None
 
 
-def _conflict_payload(
-    entry: object,
-    *,
-    candidate_refs: list[str] | None = None,
-    target_refs: list[str] | None = None,
-) -> dict[str, object]:
-    return _payload(
-        entry,
-        outcome='open_conflict',
-        relation='mutually_incompatible',
-        target=str(entry.memory_version_id),
-        candidate_refs=candidate_refs,
-        target_refs=target_refs,
-        reason_code='same_scope_contradiction',
-        applicability='same',
-        temporal_order='unordered',
-        reason='same scope contradiction',
-    )
+def _conflict_payload() -> dict[str, object]:
+    return _payload(relation='mutually_incompatible', reason='same scope contradiction')
 
 
 def _conflict_data(
@@ -566,7 +481,7 @@ def _conflict_data(
 def test_open_conflict_opens_with_genuinely_unordered_evidence() -> None:
     module, data, entry, candidate = _fixture()
     data = _conflict_data(module, data, entry, candidate_at=_TARGET_EVIDENCE_AT, target_at=_TARGET_EVIDENCE_AT)
-    payload = _conflict_payload(entry, candidate_refs=['candidate-ref'])
+    payload = _conflict_payload()
 
     with _unchanged(candidate.project_id):
         verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
@@ -577,7 +492,7 @@ def test_open_conflict_opens_with_genuinely_unordered_evidence() -> None:
 @pytest.mark.django_db
 def test_parse_judge_verdict_strips_markdown_json_fence() -> None:
     module, data, entry, candidate = _fixture()
-    payload = _payload(entry)
+    payload = _payload()
     fenced = f'```json\n{json.dumps(payload)}\n```'
 
     with _unchanged(candidate.project_id):
@@ -592,7 +507,7 @@ def test_open_conflict_denied_when_comparison_incomplete() -> None:
     data = _conflict_data(
         module, data, entry, candidate_at=_TARGET_EVIDENCE_AT, target_at=_TARGET_EVIDENCE_AT, complete=False
     )
-    payload = _conflict_payload(entry, candidate_refs=['candidate-ref'])
+    payload = _conflict_payload()
 
     with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
         module.parse_curation_judge_verdict(json.dumps(payload), data)
@@ -604,7 +519,7 @@ def test_open_conflict_denied_when_comparison_incomplete() -> None:
 def test_open_conflict_denied_when_deterministic_precedence_exists() -> None:
     module, data, entry, candidate = _fixture()
     data = _conflict_data(module, data, entry, candidate_at=_CANDIDATE_EVIDENCE_AT, target_at=_TARGET_EVIDENCE_AT)
-    payload = _conflict_payload(entry, candidate_refs=['candidate-ref'])
+    payload = _conflict_payload()
 
     with _unchanged(candidate.project_id):
         verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
@@ -628,7 +543,7 @@ def test_open_conflict_denied_when_evidence_refs_empty(side: str) -> None:
         candidate_refs=candidate_refs,
         target_refs=target_refs,
     )
-    payload = _conflict_payload(entry, candidate_refs=list(candidate_refs), target_refs=list(target_refs))
+    payload = _conflict_payload()
 
     with _unchanged(candidate.project_id):
         verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
@@ -645,14 +560,17 @@ def test_open_conflict_denied_when_evidence_refs_empty(side: str) -> None:
         lambda payload: payload.pop('reason'),
         lambda payload: payload['comparisons'][0].update({'extra': 1}),
         lambda payload: payload['comparisons'][0].pop('relation'),
+        lambda payload: payload['comparisons'][0].pop('applicability'),
         lambda payload: payload.update({'target_memory_version_id': 'not-a-uuid'}),
+        lambda payload: payload.update({'outcome': 'publish_new'}),
+        lambda payload: payload.update({'candidate_evidence_refs': ['candidate-ref']}),
     ],
 )
 def test_judge_schema_rejects_recursive_extra_and_missing_keys(
     mutator: Callable[[dict[str, object]], object],
 ) -> None:
-    module, data, entry, candidate = _fixture()
-    payload = _payload(entry)
+    module, data, _entry, candidate = _fixture()
+    payload = _payload()
     if mutator is not None:
         mutator(payload)
     with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
@@ -665,16 +583,15 @@ def test_judge_schema_rejects_recursive_extra_and_missing_keys(
     ('field', 'value'),
     [
         ('schema_version', True),
-        ('schema_version', 1.0),
-        ('target_memory_version_id', 1),
-        ('candidate_evidence_refs', [True]),
+        ('schema_version', 2.0),
+        ('schema_version', 1),
         ('comparisons', {}),
-        ('applicability', False),
+        ('reason', 5),
     ],
 )
 def test_judge_schema_rejects_bool_as_int_and_wrong_primitive_types(field: str, value: object) -> None:
-    module, data, entry, candidate = _fixture()
-    payload = _payload(entry)
+    module, data, _entry, candidate = _fixture()
+    payload = _payload()
     payload[field] = value
     with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
         module.parse_curation_judge_verdict(json.dumps(payload), data)
@@ -683,60 +600,50 @@ def test_judge_schema_rejects_bool_as_int_and_wrong_primitive_types(field: str, 
 
 @pytest.mark.django_db
 @pytest.mark.parametrize(
-    ('outcome', 'relation', 'target', 'reason_code', 'applicability', 'temporal_order', 'candidate_tier', 'complete'),
+    ('field', 'value'),
     [
-        ('publish_new', 'unrelated', None, 'distinct_claim', 'same', 'not_applicable', 'supported', True),
-        ('publish_new', 'compatible_distinct', None, 'distinct_claim', 'same', 'not_applicable', 'supported', True),
-        ('merge_evidence', 'equivalent', 'target', 'equivalent_claim', 'same', 'not_applicable', 'supported', True),
-        (
-            'revise_memory',
-            'candidate_revises',
-            'target',
-            'same_subject_revision',
-            'same',
-            'candidate_newer',
-            'corroborated',
-            True,
-        ),
-        (
-            'supersede_memory',
-            'candidate_supersedes',
-            'target',
-            'ordered_replacement',
-            'same',
-            'candidate_newer',
-            'corroborated',
-            True,
-        ),
-        ('reject_candidate', 'redundant', 'target', 'redundant_claim', 'same', 'not_applicable', 'supported', True),
-        ('reject_candidate', 'unsupported', None, 'unsupported_claim', 'same', 'not_applicable', 'none', True),
-        (
-            'open_conflict',
-            'mutually_incompatible',
-            'target',
-            'same_scope_contradiction',
-            'same',
-            'unordered',
-            'supported',
-            True,
-        ),
+        ('index', True),
+        ('index', '1'),
+        ('index', 1.0),
+        ('relation', 'invented_relation'),
+        ('relation', False),
+        ('applicability', 'maybe'),
+        ('applicability', False),
     ],
 )
-def test_judge_allows_only_locked_outcome_relation_target_combinations(
-    outcome: str,
+def test_judge_comparison_fields_reject_wrong_types_and_unknown_enums(field: str, value: object) -> None:
+    module, data, _entry, candidate = _fixture()
+    payload = _payload()
+    payload['comparisons'][0][field] = value
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.parse_curation_judge_verdict(json.dumps(payload), data)
+    assert getattr(error.value, 'code', None) == 'judge_invalid_output'
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('relation', 'candidate_tier', 'outcome', 'derived_relation'),
+    [
+        ('unrelated', 'supported', 'publish_new', 'unrelated'),
+        ('compatible_distinct', 'supported', 'publish_new', 'compatible_distinct'),
+        ('equivalent', 'supported', 'merge_evidence', 'equivalent'),
+        ('candidate_revises', 'corroborated', 'revise_memory', 'candidate_revises'),
+        ('candidate_supersedes', 'corroborated', 'supersede_memory', 'candidate_supersedes'),
+        ('redundant', 'supported', 'reject_candidate', 'redundant'),
+        ('unsupported', 'none', 'reject_candidate', 'unsupported'),
+        ('mutually_incompatible', 'supported', 'open_conflict', 'mutually_incompatible'),
+    ],
+)
+def test_each_relation_derives_its_locked_outcome(
     relation: str,
-    target: str | None,
-    reason_code: str,
-    applicability: str,
-    temporal_order: str,
     candidate_tier: str,
-    complete: bool,
+    outcome: str,
+    derived_relation: str,
 ) -> None:
-    module, data, entry, candidate = _fixture()
+    module, data, _entry, candidate = _fixture()
     candidate_at = _TARGET_EVIDENCE_AT if outcome == 'open_conflict' else _CANDIDATE_EVIDENCE_AT
     data = replace(
         data,
-        shortlist=replace(data.shortlist, comparison_complete=complete),
         evidence=replace(
             data.evidence,
             candidate=module.ClaimEvidence(
@@ -746,66 +653,43 @@ def test_judge_allows_only_locked_outcome_relation_target_combinations(
             ),
         ),
     )
-    target_id = str(entry.memory_version_id) if target else None
-    payload = _payload(
-        entry,
-        outcome=outcome,
-        relation=relation,
-        target=target_id,
-        candidate_refs=[] if candidate_tier == 'none' else None,
-        reason_code=reason_code,
-        applicability=applicability,
-        temporal_order=temporal_order,
-    )
+    payload = _payload(relation=relation)
     with _unchanged(candidate.project_id):
         verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
     assert verdict.outcome == outcome
-    assert verdict.relation == relation
+    assert verdict.relation == derived_relation
 
 
 @pytest.mark.django_db
-def test_judge_requires_comparisons_exactly_once_in_manifest_order() -> None:
-    module, data, (first, second), candidate = _two_entry_fixture()
-    comparisons = [
-        {
-            'memory_version_id': str(first.memory_version_id),
-            'relation': 'unrelated',
-            'target_evidence_refs': ['target-ref'],
-        },
-        {
-            'memory_version_id': str(second.memory_version_id),
-            'relation': 'unrelated',
-            'target_evidence_refs': ['target-ref-2'],
-        },
-    ]
-    payload = _payload(first, comparisons=comparisons)
-    payload['comparisons'] = [comparisons[0]]
-    with _unchanged(candidate.project_id), pytest.raises(ValueError):
-        module.parse_curation_judge_verdict(json.dumps(payload), data)
-    payload['comparisons'] = [comparisons[0], comparisons[0]]
-    with _unchanged(candidate.project_id), pytest.raises(ValueError):
-        module.parse_curation_judge_verdict(json.dumps(payload), data)
-    payload['comparisons'] = list(reversed(comparisons))
-    with _unchanged(candidate.project_id), pytest.raises(ValueError):
-        module.parse_curation_judge_verdict(json.dumps(payload), data)
+def test_judge_requires_one_comparison_per_shortlist_entry_by_index() -> None:
+    module, data, entries, candidate = _two_entry_fixture()
+    comparisons = _manifest_comparisons(entries)
+    for broken in ([comparisons[0]], [comparisons[0], comparisons[0]], [*comparisons, comparisons[0]]):
+        payload = _payload(comparisons=broken)
+        with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+            module.parse_curation_judge_verdict(json.dumps(payload), data)
+        assert getattr(error.value, 'code', None) == 'judge_invalid_output'
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize('refs', [['candidate-ref'] * 2, ['invented-ref'], [f'ref-{index}' for index in range(17)]])
-def test_judge_evidence_refs_are_unique_manifest_tokens_and_capped_at_sixteen(refs: list[str]) -> None:
-    module, data, entry, candidate = _fixture()
-    payload = _payload(entry, candidate_refs=refs)
-    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
-        module.parse_curation_judge_verdict(json.dumps(payload), data)
-    expected_code = 'judge_reference_invalid' if refs == ['invented-ref'] else 'judge_invalid_output'
-    assert getattr(error.value, 'code', None) == expected_code
+def test_judge_accepts_comparisons_in_any_index_order() -> None:
+    module, data, entries, candidate = _two_entry_fixture()
+    comparisons = _manifest_comparisons(entries)
+    comparisons[1]['relation'] = 'equivalent'
+    payload = _payload(comparisons=list(reversed(comparisons)))
+
+    with _unchanged(candidate.project_id):
+        verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert verdict.outcome == 'merge_evidence'
+    assert verdict.target_memory_version_id == entries[1].memory_version_id
 
 
 @pytest.mark.django_db
 @pytest.mark.parametrize('reason', ['', 'x' * 501, 'Use sk-abcdefghijklmnop in production'])
 def test_judge_reason_is_bounded_and_redacted(reason: str) -> None:
-    module, data, entry, candidate = _fixture()
-    payload = _payload(entry, reason=reason)
+    module, data, _entry, candidate = _fixture()
+    payload = _payload(reason=reason)
     with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
         module.parse_curation_judge_verdict(json.dumps(payload), data)
     assert getattr(error.value, 'code', None) == 'judge_invalid_output'
@@ -1058,19 +942,7 @@ def test_corrupt_target_provenance_raises_operational_retry_without_downgrade() 
 @pytest.mark.django_db
 def test_targetless_outcome_is_overridden_by_an_identity_relation_comparison() -> None:
     module, data, entry, candidate = _fixture()
-    payload = _payload(
-        entry,
-        outcome='publish_new',
-        relation='unrelated',
-        target=None,
-        comparisons=[
-            {
-                'memory_version_id': str(entry.memory_version_id),
-                'relation': 'equivalent',
-                'target_evidence_refs': ['target-ref'],
-            }
-        ],
-    )
+    payload = _payload(comparisons=[{'index': 1, 'relation': 'equivalent', 'applicability': 'same'}])
 
     with _unchanged(candidate.project_id):
         verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
@@ -1082,7 +954,7 @@ def test_targetless_outcome_is_overridden_by_an_identity_relation_comparison() -
 
 @pytest.mark.django_db
 def test_supersede_requires_deterministic_precedence_not_provider_claim() -> None:
-    module, data, entry, candidate = _fixture()
+    module, data, _entry, candidate = _fixture()
     data = replace(
         data,
         evidence=replace(
@@ -1094,13 +966,7 @@ def test_supersede_requires_deterministic_precedence_not_provider_claim() -> Non
         ),
     )
     payload = _payload(
-        entry,
-        outcome='supersede_memory',
         relation='candidate_supersedes',
-        target=str(entry.memory_version_id),
-        reason_code='ordered_replacement',
-        applicability='same',
-        temporal_order='candidate_newer',
         reason='provider asserts precedence the evidence does not support',
     )
 
@@ -1113,15 +979,10 @@ def test_supersede_requires_deterministic_precedence_not_provider_claim() -> Non
 
 @pytest.mark.django_db
 def test_supersede_requires_same_applicability() -> None:
-    module, data, entry, candidate = _fixture()
+    module, data, _entry, candidate = _fixture()
     payload = _payload(
-        entry,
-        outcome='supersede_memory',
         relation='candidate_supersedes',
-        target=str(entry.memory_version_id),
-        reason_code='ordered_replacement',
         applicability='different',
-        temporal_order='candidate_newer',
         reason='supersession across a different applicability is not authorized',
     )
 
@@ -1162,7 +1023,7 @@ def test_judge_result_carries_comparison_manifest_binding(monkeypatch: pytest.Mo
     organization, project = candidate.organization, candidate.project
     session_team = candidate.team
     create_curation_policy(organization, session_team, project, task_type='curation')
-    verdict_body = json.dumps(_payload(entry))
+    verdict_body = json.dumps(_payload())
 
     class GatewayStub:
         def call(self, call_input: object) -> ProviderCallResult:
@@ -1191,7 +1052,7 @@ def test_judge_call_carries_decision_system_prompt(monkeypatch: pytest.MonkeyPat
     organization, project = candidate.organization, candidate.project
     session_team = candidate.team
     create_curation_policy(organization, session_team, project, task_type='curation')
-    verdict_body = json.dumps(_payload(entry))
+    verdict_body = json.dumps(_payload())
     calls: list[object] = []
 
     class GatewayStub:
@@ -1212,8 +1073,8 @@ def test_judge_call_carries_decision_system_prompt(monkeypatch: pytest.MonkeyPat
 
     assert calls
     assert calls[0].system_prompt == module._CURATION_JUDGE_SYSTEM_PROMPT
-    assert 'curation_judge_input.v1' in calls[0].system_prompt
-    assert 'reject_candidate form that matches the candidate evidence' in calls[0].system_prompt
+    assert 'curation_judge_input.v2' in calls[0].system_prompt
+    assert 'the system derives the outcome' in calls[0].system_prompt
     assert 'Allowed outcome and relation combinations' not in calls[0].system_prompt
     assert 'exactly one object per input comparisons entry' not in calls[0].system_prompt
 
@@ -1409,12 +1270,11 @@ def _verdict(
     temporal_order: str = 'not_applicable',
     reason_code: str = 'distinct_claim',
 ) -> object:
-    return module.CurationJudgeVerdictV1(
-        schema_version=1,
+    return module.CurationJudgeVerdict(
+        schema_version=2,
         outcome=outcome,
         relation=relation,
         target_memory_version_id=target,
-        candidate_evidence_refs=('candidate-ref',),
         comparisons=(),
         applicability=applicability,
         temporal_order=temporal_order,
@@ -1626,21 +1486,8 @@ def _agent_parse_data(target_specs: list[tuple[str, bool]]) -> tuple[object, obj
 def test_publish_new_allows_cross_visibility_identity_comparison() -> None:
     module, data, entries = _agent_parse_data([(VisibilityScope.PROJECT, False)])
     payload = {
-        'schema_version': 1,
-        'outcome': 'publish_new',
-        'relation': 'compatible_distinct',
-        'target_memory_version_id': None,
-        'candidate_evidence_refs': ['candidate-ref'],
-        'comparisons': [
-            {
-                'memory_version_id': str(entries[0].memory_version_id),
-                'relation': 'mutually_incompatible',
-                'target_evidence_refs': ['target-ref-0'],
-            }
-        ],
-        'applicability': 'same',
-        'temporal_order': 'not_applicable',
-        'reason_code': 'distinct_claim',
+        'schema_version': 2,
+        'comparisons': [{'index': 1, 'relation': 'mutually_incompatible', 'applicability': 'same'}],
         'reason': 'distinct claim against a project-global target',
     }
 
@@ -1655,21 +1502,8 @@ def test_publish_new_allows_cross_visibility_identity_comparison() -> None:
 def test_publish_new_yields_to_a_same_visibility_identity_comparison() -> None:
     module, data, entries = _agent_parse_data([(VisibilityScope.TEAM, True)])
     payload = {
-        'schema_version': 1,
-        'outcome': 'publish_new',
-        'relation': 'compatible_distinct',
-        'target_memory_version_id': None,
-        'candidate_evidence_refs': ['candidate-ref'],
-        'comparisons': [
-            {
-                'memory_version_id': str(entries[0].memory_version_id),
-                'relation': 'mutually_incompatible',
-                'target_evidence_refs': ['target-ref-0'],
-            }
-        ],
-        'applicability': 'same',
-        'temporal_order': 'not_applicable',
-        'reason_code': 'distinct_claim',
+        'schema_version': 2,
+        'comparisons': [{'index': 1, 'relation': 'mutually_incompatible', 'applicability': 'same'}],
         'reason': 'same-visibility identity should block targetless publish',
     }
 
@@ -1685,26 +1519,11 @@ def test_publish_new_yields_to_a_same_visibility_identity_comparison() -> None:
 def test_same_visibility_target_merges_over_targetless_publish() -> None:
     module, data, entries = _agent_parse_data([(VisibilityScope.PROJECT, False), (VisibilityScope.TEAM, True)])
     payload = {
-        'schema_version': 1,
-        'outcome': 'merge_evidence',
-        'relation': 'equivalent',
-        'target_memory_version_id': str(entries[1].memory_version_id),
-        'candidate_evidence_refs': ['candidate-ref'],
+        'schema_version': 2,
         'comparisons': [
-            {
-                'memory_version_id': str(entries[0].memory_version_id),
-                'relation': 'mutually_incompatible',
-                'target_evidence_refs': ['target-ref-0'],
-            },
-            {
-                'memory_version_id': str(entries[1].memory_version_id),
-                'relation': 'equivalent',
-                'target_evidence_refs': ['target-ref-1'],
-            },
+            {'index': 1, 'relation': 'mutually_incompatible', 'applicability': 'same'},
+            {'index': 2, 'relation': 'equivalent', 'applicability': 'same'},
         ],
-        'applicability': 'same',
-        'temporal_order': 'not_applicable',
-        'reason_code': 'equivalent_claim',
         'reason': 'equivalent to same-visibility target',
     }
 
@@ -1715,7 +1534,7 @@ def test_same_visibility_target_merges_over_targetless_publish() -> None:
 
 
 @pytest.mark.django_db
-def test_provider_path_emits_cross_visibility_rule_and_settles(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_provider_path_settles_cross_visibility_identity_without_a_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
     from engram.model_policy.services import OpenAICompatibleGateway
 
     module = _judge_module()
@@ -1727,21 +1546,8 @@ def test_provider_path_emits_cross_visibility_rule_and_settles(monkeypatch: pyte
     _module, data, entries = _agent_parse_data_for(candidate, scope, [(VisibilityScope.PROJECT, False)])
 
     publish_payload = {
-        'schema_version': 1,
-        'outcome': 'publish_new',
-        'relation': 'compatible_distinct',
-        'target_memory_version_id': None,
-        'candidate_evidence_refs': ['candidate-ref'],
-        'comparisons': [
-            {
-                'memory_version_id': str(entries[0].memory_version_id),
-                'relation': 'mutually_incompatible',
-                'target_evidence_refs': ['target-ref-0'],
-            }
-        ],
-        'applicability': 'same',
-        'temporal_order': 'not_applicable',
-        'reason_code': 'distinct_claim',
+        'schema_version': 2,
+        'comparisons': [{'index': 1, 'relation': 'compatible_distinct', 'applicability': 'same'}],
         'reason': 'distinct claim',
     }
     opener = _opener_returning(_completion_bytes(publish_payload))
@@ -1750,26 +1556,13 @@ def test_provider_path_emits_cross_visibility_rule_and_settles(monkeypatch: pyte
 
     result = module.JudgeCurationCandidate().execute(data)
 
-    assert b'cross-visibility' in opener.requests[0].data.lower()
+    assert b'curation_judge_input.v2' in opener.requests[0].data
     assert result.verdict.outcome == 'publish_new'
     assert result.verdict.target_memory_version_id is None
 
     conflict_payload = {
-        'schema_version': 1,
-        'outcome': 'open_conflict',
-        'relation': 'mutually_incompatible',
-        'target_memory_version_id': str(entries[0].memory_version_id),
-        'candidate_evidence_refs': ['candidate-ref'],
-        'comparisons': [
-            {
-                'memory_version_id': str(entries[0].memory_version_id),
-                'relation': 'mutually_incompatible',
-                'target_evidence_refs': ['target-ref-0'],
-            }
-        ],
-        'applicability': 'same',
-        'temporal_order': 'unordered',
-        'reason_code': 'same_scope_contradiction',
+        'schema_version': 2,
+        'comparisons': [{'index': 1, 'relation': 'mutually_incompatible', 'applicability': 'same'}],
         'reason': 'rule-ignoring conflict',
     }
     opener_conflict = _opener_returning(_completion_bytes(conflict_payload))
@@ -1801,7 +1594,7 @@ def test_judge_forwards_the_attempt_index_to_the_provider_call(monkeypatch: pyte
                 call_record_id=uuid.uuid4(),
                 redaction_state='clean',
                 generated_title='',
-                generated_body=json.dumps(_payload(entry)),
+                generated_body=json.dumps(_payload()),
             )
 
     monkeypatch.setattr(module, 'get_provider_gateway', lambda *_args, **_kwargs: GatewayStub())

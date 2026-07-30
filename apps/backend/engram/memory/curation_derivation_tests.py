@@ -20,7 +20,7 @@ from engram.memory.curation_judge import (
     ClaimEvidence,
     CurationEvidenceContext,
     CurationJudgeInput,
-    CurationJudgeVerdictV1,
+    CurationJudgeVerdict,
 )
 from engram.memory.curation_shortlist import CurationShortlist, CurationShortlistEntry
 from engram.memory.deterministic_gates import EffectiveCandidateScope, SanitizedCandidateView
@@ -146,23 +146,26 @@ def _relations(data: CurationJudgeInput, assignment: tuple[str, ...]) -> dict[uu
     }
 
 
-def _verdict(decision: DerivedDecision, data: CurationJudgeInput, applicability: str) -> CurationJudgeVerdictV1:
-    return CurationJudgeVerdictV1(
-        schema_version=1,
+def _applicability(data: CurationJudgeInput, assignment: tuple[str, ...]) -> dict[uuid.UUID, str]:
+    return {entry.memory_version_id: value for entry, value in zip(data.shortlist.entries, assignment, strict=True)}
+
+
+def _verdict(decision: DerivedDecision, data: CurationJudgeInput) -> CurationJudgeVerdict:
+    return CurationJudgeVerdict(
+        schema_version=2,
         outcome=decision.outcome,
         relation=decision.relation,
         target_memory_version_id=decision.target_memory_version_id,
-        candidate_evidence_refs=data.evidence.candidate.refs,
         comparisons=(),
-        applicability=applicability,
+        applicability=decision.applicability,
         temporal_order=decision.temporal_order,
         reason_code=decision.reason_code,
         reason='derived decision',
     )
 
 
-def _single_target_lattice() -> list[tuple[CurationJudgeInput, tuple[str, ...], str]]:
-    rows: list[tuple[CurationJudgeInput, tuple[str, ...], str]] = []
+def _single_target_lattice() -> list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]]:
+    rows: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]] = []
     for relation, candidate_tier, target_tier, complete, conflict, same_visibility in itertools.product(
         _RELATIONS, _TIERS, _TIERS, (True, False), (True, False), (True, False)
     ):
@@ -181,7 +184,7 @@ def _single_target_lattice() -> list[tuple[CurationJudgeInput, tuple[str, ...], 
                 ),
             )
             for applicability in _APPLICABILITIES:
-                rows.append((data, (relation,), applicability))
+                rows.append((data, (relation,), (applicability,)))
 
     return rows
 
@@ -194,8 +197,8 @@ _PAIR_SPECS = (
 )
 
 
-def _two_target_lattice() -> list[tuple[CurationJudgeInput, tuple[str, ...], str]]:
-    rows: list[tuple[CurationJudgeInput, tuple[str, ...], str]] = []
+def _two_target_lattice() -> list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]]:
+    rows: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]] = []
     for first_spec, second_spec, candidate_tier, complete in itertools.product(
         _PAIR_SPECS, _PAIR_SPECS, _TIERS, (True, False)
     ):
@@ -206,14 +209,14 @@ def _two_target_lattice() -> list[tuple[CurationJudgeInput, tuple[str, ...], str
             specs=(first_spec, second_spec),
         )
         for assignment in itertools.product(_RELATIONS, _RELATIONS):
-            for applicability in _APPLICABILITIES:
+            for applicability in itertools.product(_APPLICABILITIES, _APPLICABILITIES):
                 rows.append((data, assignment, applicability))
 
     return rows
 
 
-def _empty_refs_lattice() -> list[tuple[CurationJudgeInput, tuple[str, ...], str]]:
-    rows: list[tuple[CurationJudgeInput, tuple[str, ...], str]] = []
+def _empty_refs_lattice() -> list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]]:
+    rows: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]] = []
     for relation, complete, candidate_has_refs, target_has_refs, target_at in itertools.product(
         _RELATIONS, (True, False), (True, False), (True, False), _TARGET_MOMENTS
     ):
@@ -233,13 +236,13 @@ def _empty_refs_lattice() -> list[tuple[CurationJudgeInput, tuple[str, ...], str
             ),
         )
         for applicability in _APPLICABILITIES:
-            rows.append((data, (relation,), applicability))
+            rows.append((data, (relation,), (applicability,)))
 
     return rows
 
 
 @pytest.fixture(scope='module')
-def f_lattice() -> list[tuple[CurationJudgeInput, tuple[str, ...], str]]:
+def f_lattice() -> list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]]:
     return _single_target_lattice() + _two_target_lattice() + _empty_refs_lattice()
 
 
@@ -248,30 +251,30 @@ def _target_facts(facts: DerivationFacts, target_id: uuid.UUID | None) -> Target
 
 
 def test_derivation_never_raises_over_the_lattice(
-    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], str]],
+    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]],
 ) -> None:
     for data, assignment, applicability in f_lattice:
         facts = build_derivation_facts(data)
-        derive_decision(facts, _relations(data, assignment), applicability)
+        derive_decision(facts, _relations(data, assignment), _applicability(data, applicability))
 
 
 def test_every_derived_decision_passes_the_evidence_policy(
-    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], str]],
+    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]],
 ) -> None:
     for data, assignment, applicability in f_lattice:
         facts = build_derivation_facts(data)
-        decision = derive_decision(facts, _relations(data, assignment), applicability)
+        decision = derive_decision(facts, _relations(data, assignment), _applicability(data, applicability))
         if decision is None:
             continue
-        curation_judge._apply_evidence_policy(_verdict(decision, data, applicability), data)
+        curation_judge._apply_evidence_policy(_verdict(decision, data), data)
 
 
 def test_mutation_outcomes_never_target_cross_visibility_entries(
-    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], str]],
+    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]],
 ) -> None:
     for data, assignment, applicability in f_lattice:
         facts = build_derivation_facts(data)
-        decision = derive_decision(facts, _relations(data, assignment), applicability)
+        decision = derive_decision(facts, _relations(data, assignment), _applicability(data, applicability))
         if decision is None or decision.outcome not in _MUTATIONS:
             continue
         target = _target_facts(facts, decision.target_memory_version_id)
@@ -280,11 +283,11 @@ def test_mutation_outcomes_never_target_cross_visibility_entries(
 
 
 def test_merge_revise_supersede_never_touch_a_conflicted_target(
-    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], str]],
+    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]],
 ) -> None:
     for data, assignment, applicability in f_lattice:
         facts = build_derivation_facts(data)
-        decision = derive_decision(facts, _relations(data, assignment), applicability)
+        decision = derive_decision(facts, _relations(data, assignment), _applicability(data, applicability))
         if decision is None or decision.outcome not in _CONFLICT_BLOCKED:
             continue
         target = _target_facts(facts, decision.target_memory_version_id)
@@ -293,11 +296,11 @@ def test_merge_revise_supersede_never_touch_a_conflicted_target(
 
 
 def test_mutation_outcomes_require_both_tiers_in_the_supported_set(
-    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], str]],
+    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]],
 ) -> None:
     for data, assignment, applicability in f_lattice:
         facts = build_derivation_facts(data)
-        decision = derive_decision(facts, _relations(data, assignment), applicability)
+        decision = derive_decision(facts, _relations(data, assignment), _applicability(data, applicability))
         if decision is None or decision.outcome not in _MUTATIONS:
             continue
         target = _target_facts(facts, decision.target_memory_version_id)
@@ -307,35 +310,36 @@ def test_mutation_outcomes_require_both_tiers_in_the_supported_set(
 
 
 def test_complete_comparison_always_yields_a_decision(
-    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], str]],
+    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]],
 ) -> None:
     for data, assignment, applicability in f_lattice:
         facts = build_derivation_facts(data)
         if not facts.comparison_complete:
             continue
-        assert derive_decision(facts, _relations(data, assignment), applicability) is not None
+        assert derive_decision(facts, _relations(data, assignment), _applicability(data, applicability)) is not None
 
 
 def test_no_decision_implies_incomplete_comparison(
-    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], str]],
+    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]],
 ) -> None:
     for data, assignment, applicability in f_lattice:
         facts = build_derivation_facts(data)
-        if derive_decision(facts, _relations(data, assignment), applicability) is None:
+        if derive_decision(facts, _relations(data, assignment), _applicability(data, applicability)) is None:
             assert facts.comparison_complete is False
 
 
 def test_derivation_is_deterministic(
-    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], str]],
+    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]],
 ) -> None:
     for data, assignment, applicability in f_lattice:
         facts = build_derivation_facts(data)
         relations = _relations(data, assignment)
-        assert derive_decision(facts, relations, applicability) == derive_decision(facts, relations, applicability)
+        values = _applicability(data, applicability)
+        assert derive_decision(facts, relations, values) == derive_decision(facts, relations, values)
 
 
 def test_empty_feasible_set_forbids_every_relation_assignment(
-    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], str]],
+    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]],
 ) -> None:
     checked = 0
     seen: set[int] = set()
@@ -349,7 +353,7 @@ def test_empty_feasible_set_forbids_every_relation_assignment(
         checked += 1
         for assignment in itertools.product(_RELATIONS, repeat=len(facts.targets)):
             for applicability in _APPLICABILITIES:
-                assert derive_decision(facts, _relations(data, assignment), applicability) is None
+                assert derive_decision(facts, _relations(data, assignment), _applicability(data, applicability)) is None
 
     assert checked > 0
 
@@ -359,7 +363,9 @@ def test_ties_within_a_rung_resolve_to_shortlist_order() -> None:
     data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=(spec, spec))
     facts = build_derivation_facts(data)
 
-    decision = derive_decision(facts, _relations(data, ('equivalent', 'equivalent')), 'same')
+    decision = derive_decision(
+        facts, _relations(data, ('equivalent', 'equivalent')), _applicability(data, ('same', 'same'))
+    )
 
     assert decision is not None
     assert decision.outcome == 'merge_evidence'
@@ -371,7 +377,9 @@ def test_open_conflict_outranks_a_merge_on_another_target() -> None:
     data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=(spec, spec))
     facts = build_derivation_facts(data)
 
-    decision = derive_decision(facts, _relations(data, ('equivalent', 'mutually_incompatible')), 'same')
+    decision = derive_decision(
+        facts, _relations(data, ('equivalent', 'mutually_incompatible')), _applicability(data, ('same', 'same'))
+    )
 
     assert decision is not None
     assert decision.outcome == 'open_conflict'
@@ -385,7 +393,9 @@ def test_supersede_outranks_revise_on_another_target() -> None:
     data = _judge_input(candidate_tier='corroborated', candidate_at=_EQUAL, complete=True, specs=(spec, spec))
     facts = build_derivation_facts(data)
 
-    decision = derive_decision(facts, _relations(data, ('candidate_revises', 'candidate_supersedes')), 'same')
+    decision = derive_decision(
+        facts, _relations(data, ('candidate_revises', 'candidate_supersedes')), _applicability(data, ('same', 'same'))
+    )
 
     assert decision is not None
     assert decision.outcome == 'supersede_memory'
@@ -399,7 +409,7 @@ def test_revise_fires_when_no_supersede_relation_is_asserted() -> None:
     data = _judge_input(candidate_tier='corroborated', candidate_at=_EQUAL, complete=True, specs=(spec,))
     facts = build_derivation_facts(data)
 
-    decision = derive_decision(facts, _relations(data, ('candidate_revises',)), 'same')
+    decision = derive_decision(facts, _relations(data, ('candidate_revises',)), _applicability(data, ('same',)))
 
     assert decision is not None
     assert decision.outcome == 'revise_memory'
@@ -413,7 +423,7 @@ def test_redundant_target_outranks_publish_new() -> None:
     data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=(spec,))
     facts = build_derivation_facts(data)
 
-    decision = derive_decision(facts, _relations(data, ('redundant',)), 'same')
+    decision = derive_decision(facts, _relations(data, ('redundant',)), _applicability(data, ('same',)))
 
     assert decision is not None
     assert decision.outcome == 'reject_candidate'
@@ -428,7 +438,7 @@ def test_redundant_target_below_tier_falls_through_to_publish_new() -> None:
     data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=(spec,))
     facts = build_derivation_facts(data)
 
-    decision = derive_decision(facts, _relations(data, ('redundant',)), 'same')
+    decision = derive_decision(facts, _relations(data, ('redundant',)), _applicability(data, ('same',)))
 
     assert decision is not None
     assert decision.outcome == 'publish_new'
@@ -443,15 +453,18 @@ def test_publish_new_relation_is_unrelated_only_when_every_comparison_is_unrelat
     data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=(spec,))
     facts = build_derivation_facts(data)
 
-    assert derive_decision(facts, _relations(data, ('unrelated',)), 'same').relation == 'unrelated'
-    assert derive_decision(facts, _relations(data, ('compatible_distinct',)), 'same').relation == 'compatible_distinct'
+    applicability = _applicability(data, ('same',))
+
+    assert derive_decision(facts, _relations(data, ('unrelated',)), applicability).relation == 'unrelated'
+    distinct = derive_decision(facts, _relations(data, ('compatible_distinct',)), applicability)
+    assert distinct.relation == 'compatible_distinct'
 
 
 def test_empty_shortlist_publish_new_is_unrelated_and_not_applicable() -> None:
     data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=())
     facts = build_derivation_facts(data)
 
-    decision = derive_decision(facts, {}, 'same')
+    decision = derive_decision(facts, {}, {})
 
     assert decision is not None
     assert decision.outcome == 'publish_new'
@@ -465,7 +478,7 @@ def test_zero_evidence_candidate_claiming_supersession_is_rejected_as_unsupporte
     data = _judge_input(candidate_tier='none', candidate_at=_LATER, complete=True, specs=(spec,))
     facts = build_derivation_facts(data)
 
-    decision = derive_decision(facts, _relations(data, ('candidate_supersedes',)), 'same')
+    decision = derive_decision(facts, _relations(data, ('candidate_supersedes',)), _applicability(data, ('same',)))
 
     assert decision is not None
     assert decision.outcome == 'reject_candidate'
@@ -481,7 +494,7 @@ def test_open_conflict_is_skipped_when_comparison_is_incomplete() -> None:
     data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=False, specs=(spec,))
     facts = build_derivation_facts(data)
 
-    assert derive_decision(facts, _relations(data, ('mutually_incompatible',)), 'same') is None
+    assert derive_decision(facts, _relations(data, ('mutually_incompatible',)), _applicability(data, ('same',))) is None
 
 
 def test_open_conflict_is_skipped_when_precedence_is_deterministic() -> None:
@@ -489,7 +502,7 @@ def test_open_conflict_is_skipped_when_precedence_is_deterministic() -> None:
     data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=(spec,))
     facts = build_derivation_facts(data)
 
-    decision = derive_decision(facts, _relations(data, ('mutually_incompatible',)), 'same')
+    decision = derive_decision(facts, _relations(data, ('mutually_incompatible',)), _applicability(data, ('same',)))
 
     assert decision is not None
     assert decision.outcome == 'publish_new'
@@ -502,7 +515,7 @@ def test_open_conflict_is_skipped_when_either_side_has_no_refs() -> None:
     data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=(spec,))
     facts = build_derivation_facts(data)
 
-    decision = derive_decision(facts, _relations(data, ('mutually_incompatible',)), 'same')
+    decision = derive_decision(facts, _relations(data, ('mutually_incompatible',)), _applicability(data, ('same',)))
 
     assert decision is not None
     assert decision.outcome == 'publish_new'
@@ -514,7 +527,7 @@ def test_mutation_rungs_require_same_applicability() -> None:
     facts = build_derivation_facts(data)
 
     for relation in ('equivalent', 'candidate_revises', 'candidate_supersedes'):
-        decision = derive_decision(facts, _relations(data, (relation,)), 'different')
+        decision = derive_decision(facts, _relations(data, (relation,)), _applicability(data, ('different',)))
         assert decision is not None
         assert decision.outcome == 'publish_new'
 
@@ -524,7 +537,7 @@ def test_redundant_rung_ignores_applicability() -> None:
     data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=(spec,))
     facts = build_derivation_facts(data)
 
-    decision = derive_decision(facts, _relations(data, ('redundant',)), 'different')
+    decision = derive_decision(facts, _relations(data, ('redundant',)), _applicability(data, ('different',)))
 
     assert decision is not None
     assert decision.outcome == 'reject_candidate'
@@ -536,7 +549,7 @@ def test_temporal_order_reports_target_newer() -> None:
     data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=(spec,))
     facts = build_derivation_facts(data)
 
-    decision = derive_decision(facts, _relations(data, ('equivalent',)), 'same')
+    decision = derive_decision(facts, _relations(data, ('equivalent',)), _applicability(data, ('same',)))
 
     assert decision is not None
     assert decision.outcome == 'merge_evidence'
@@ -601,3 +614,34 @@ def test_facts_ignore_shortlist_entries_without_evidence() -> None:
     assert facts.targets[0].tier == 'none'
     assert facts.targets[0].has_refs is False
     assert facts.targets[0].candidate_precedes is False
+
+
+def test_applicability_is_evaluated_per_target() -> None:
+    spec = _TargetSpec(tier='supported', same_visibility=True, has_open_conflict=False, target_at=_EQUAL)
+    data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=(spec, spec))
+    facts = build_derivation_facts(data)
+    first, second = (entry.memory_version_id for entry in data.shortlist.entries)
+
+    decision = derive_decision(
+        facts,
+        _relations(data, ('equivalent', 'equivalent')),
+        _applicability(data, ('different', 'same')),
+    )
+
+    assert decision is not None
+    assert decision.outcome == 'merge_evidence'
+    assert decision.target_memory_version_id == second
+    assert decision.applicability == 'same'
+    assert decision.target_memory_version_id != first
+
+
+def test_targetless_decision_reports_not_applicable_applicability() -> None:
+    spec = _TargetSpec(tier='supported', same_visibility=True, has_open_conflict=False, target_at=_EQUAL)
+    data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=(spec,))
+    facts = build_derivation_facts(data)
+
+    decision = derive_decision(facts, _relations(data, ('unrelated',)), _applicability(data, ('same',)))
+
+    assert decision is not None
+    assert decision.outcome == 'publish_new'
+    assert decision.applicability == 'not_applicable'
