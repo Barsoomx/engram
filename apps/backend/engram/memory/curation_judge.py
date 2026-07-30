@@ -579,7 +579,7 @@ def build_curation_judge_prompt(data: CurationJudgeInput) -> str:
 
 def _fallback_eligible(error: CurationJudgeError | ModelPolicyError) -> bool:
     if isinstance(error, CurationJudgeError):
-        return error.code in {'judge_invalid_output', 'judge_reference_invalid'}
+        return error.code == 'judge_invalid_output'
 
     status = error.http_status
     if status is None:
