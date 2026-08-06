@@ -18,7 +18,7 @@ structlog = "^26.1.0"
 structlog-sentry = "^2.2.1"
 django-structlog = "^9.1.1"
 django-redis = "^7.0.0"
-cryptography = "^49.0.0"
+cryptography = "^50.0.0"
 django-cors-headers = "^4.9.0"
 pgvector = "^0.4.2"
 
